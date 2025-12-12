@@ -1,227 +1,381 @@
+import io
+import math
+import random
 import numpy as np
 import pandas as pd
 import streamlit as st
+import matplotlib.pyplot as plt
+import imageio.v2 as imageio
 
-# -----------------------
-# PAGE CONFIG
-# -----------------------
-st.set_page_config(
-    page_title="Vero Cell Culture Growth – Vero on Cytodex 1",
-    layout="wide"
-)
+# =========================
+# Streamlit config
+# =========================
+st.set_page_config(page_title="Microcarrier CA (Vero) – Monte Carlo", layout="wide")
 
-st.title("Vero Cell Culture Growth Model")
-st.caption("Conceptual model for Vero cells on Cytodex 1 microcarriers – for training & illustration, not for GMP use.")
+# =========================
+# Constants: cell states
+# =========================
+UNOCCUPIED = 0
+OCCUPIED = 1
+NEWLY_OCCUPIED = 2
+INHIBITED = 3
+MULTILAYER = 4
 
-st.markdown(
+STATE_NAMES = {
+    UNOCCUPIED: "UNOCCUPIED",
+    OCCUPIED: "OCCUPIED",
+    NEWLY_OCCUPIED: "NEWLY_OCCUPIED",
+    INHIBITED: "INHIBITED",
+    MULTILAYER: "MULTILAYER",
+}
+
+# Colors (RGBA) for sphere as requested
+STATE_COLORS = np.array([
+    [0.83, 0.83, 0.83, 1.0],  # UNOCCUPIED  light grey
+    [0.50, 0.00, 0.50, 1.0],  # OCCUPIED    purple
+    [0.18, 0.00, 0.30, 1.0],  # NEWLY_OCCUPIED dark purple
+    [0.85, 0.00, 0.00, 1.0],  # INHIBITED   red
+    [0.35, 0.00, 0.00, 1.0],  # MULTILAYER  dark red
+], dtype=float)
+
+
+# =========================
+# Sphere helpers
+# =========================
+def map_to_sphere(U: np.ndarray, V: np.ndarray, r: float = 1.0):
+    phi = U * np.pi
+    theta = V * 2 * np.pi
+    X = r * np.sin(phi) * np.cos(theta)
+    Y = r * np.sin(phi) * np.sin(theta)
+    Z = r * np.cos(phi)
+    return X, Y, Z
+
+
+def render_sphere_frame(grid: np.ndarray, title: str):
+    """Return a matplotlib figure for a single sphere frame."""
+    fig = plt.figure(figsize=(5.2, 5.2))
+    ax = fig.add_subplot(111, projection="3d")
+
+    n = grid.shape[0]
+    u = np.linspace(0, 1, n)
+    v = np.linspace(0, 1, n)
+    U, V = np.meshgrid(u, v)
+    X, Y, Z = map_to_sphere(U, V)
+
+    facecolors = STATE_COLORS[grid.astype(int)]
+    ax.plot_surface(
+        X, Y, Z,
+        facecolors=facecolors,
+        linewidth=0,
+        antialiased=False,
+        shade=False,
+    )
+    ax.set_title(title, pad=10)
+    ax.set_axis_off()
+    ax.set_box_aspect([1, 1, 1])
+    ax.view_init(elev=22, azim=35)
+    plt.tight_layout()
+    return fig
+
+
+def fig_to_png_bytes(fig) -> bytes:
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
+
+
+def make_gif_from_grids(grids, title_prefix: str, cap_value: float, duration_s: float = 0.8) -> bytes:
+    """Create GIF bytes from list of grid snapshots."""
+    frames = []
+    for t, grid in enumerate(grids, start=1):
+        fig = render_sphere_frame(grid, f"{title_prefix} (MAX≈{cap_value:.1f}) – step {t}")
+        png_bytes = fig_to_png_bytes(fig)
+        frames.append(imageio.imread(png_bytes))
+    out = io.BytesIO()
+    imageio.mimsave(out, frames, format="GIF", duration=duration_s)
+    out.seek(0)
+    return out.read()
+
+
+# =========================
+# CA simulation
+# =========================
+def run_experiment(
+    time_steps: int,
+    max_cells_mean: float,
+    max_cells_sd: float,
+    inoc_mean: float,
+    inoc_sd: float,
+    multilayer_threshold: int,
+):
     """
-This model simulates batch growth of Vero cells on Cytodex 1 microcarriers using a **logistic growth** equation.  
-The effective growth rate μ and carrying capacity Xmax are estimated from **process conditions**:
-
-- pH (5–9)  
-- Cytodex 1 concentration (1–10 g/L)  
-- Glucose concentration (0–6 g/L)  
-- Glucosamine concentration (0–20 mM)  
-- Temperature (30–39 °C)
-"""
-)
-
-# -----------------------
-# SIDEBAR – INPUTS
-# -----------------------
-st.sidebar.header("Process conditions")
-
-# Time settings
-st.sidebar.subheader("Time settings")
-t_end = st.sidebar.slider(
-    "Simulation time (hours)",
-    min_value=48,
-    max_value=336,
-    value=168,
-    step=24
-)
-n_points = st.sidebar.slider(
-    "Number of time points",
-    min_value=100,
-    max_value=500,
-    value=300,
-    step=50
-)
-
-# Initial cell density
-st.sidebar.subheader("Initial conditions")
-X0 = st.sidebar.number_input(
-    "Initial viable cell density X₀ (cells/mL)",
-    min_value=1e4,
-    max_value=1e7,
-    value=3e5,
-    step=1e5,
-    format="%.3e"
-)
-
-# Process variables – Vero on Cytodex 1
-st.sidebar.subheader("Culture parameters")
-
-pH = st.sidebar.slider("pH", min_value=5.0, max_value=9.0, value=7.2, step=0.1)
-temp = st.sidebar.slider("Temperature (°C)", min_value=30.0, max_value=39.0, value=37.0, step=0.1)
-cytodex = st.sidebar.slider("Cytodex 1 (g/L)", min_value=1.0, max_value=10.0, value=3.0, step=0.5)
-glucose = st.sidebar.slider("Glucose (g/L)", min_value=0.0, max_value=6.0, value=3.0, step=0.1)
-glucosamine = st.sidebar.slider("Glucosamine (mM)", min_value=0.0, max_value=20.0, value=4.0, step=0.5)
-
-# -----------------------
-# SUPPORT FUNCTIONS
-# -----------------------
-
-def gaussian_factor(x, x_opt, width):
+    Returns:
+      cap (float), counts_over_time (dict[str]->list), sphere_snapshots (list of grids)
     """
-    Symmetric bell-shaped factor between 0 and 1.
-    width ~ half-width of 'good' region.
-    """
-    return np.exp(-0.5 * ((x - x_opt) / width) ** 2)
+    cap = max(1.0, np.random.normal(max_cells_mean, max_cells_sd))
+    inoc = max(0.0, np.random.normal(inoc_mean, inoc_sd))
+    inoc_density = inoc / cap
 
-def monod_factor(S, Ks):
-    """Simple Monod-like saturation between 0 and 1."""
-    return S / (Ks + S) if S > 0 else 0.0
+    grid_size = max(2, int(round(math.sqrt(cap))))
+    grid = np.zeros((grid_size, grid_size), dtype=int)
 
-def bounded_saturation(x, x_opt, Ks_low, Ks_high):
-    """
-    Factor that rises with x (like Monod) and gently penalizes strong overdose.
-    x_opt is where it’s roughly near 1.
-    """
-    # Low-side saturation
-    low = monod_factor(x, Ks_low)
-    # High-side penalty – gets <1 when x >> x_opt
-    penalty = 1.0 / (1.0 + ((max(x - x_opt, 0) / Ks_high) ** 2))
-    return low * penalty
+    total_sites = grid_size**2
+    n_seed = min(max(int(total_sites * inoc_density), 0), total_sites)
+    if n_seed > 0:
+        for pos in random.sample(range(total_sites), n_seed):
+            x, y = divmod(pos, grid_size)
+            grid[x, y] = OCCUPIED
 
-def compute_mu_and_xmax(pH, temp, cytodex, glucose, glucosamine, X0):
-    """
-    Very simplified empirical-like model for Vero cells
-    on Cytodex 1 in batch mode.
-    """
-    # Baseline parameters (tunable)
-    mu_max = 0.04    # 1/h – rough typical for Vero log phase
-    Xmax_base = 2e6  # cells/mL – base carrying capacity
+    multilayer_counter = np.zeros_like(grid)
+    snapshots = []
 
-    # Individual factors (0–1)
-    # pH – Vero typically likes ~7.2–7.4
-    f_pH_mu = gaussian_factor(pH, x_opt=7.2, width=0.6)
-    f_pH_X = gaussian_factor(pH, x_opt=7.2, width=0.7)
+    counts = {k: [] for k in ["UNOCCUPIED","OCCUPIED","NEWLY_OCCUPIED","INHIBITED","MULTILAYER","OCCUPIED_averaged"]}
 
-    # Temperature – optimum around 37 °C, some tolerance
-    f_T_mu = gaussian_factor(temp, x_opt=37.0, width=1.5)
-    f_T_X = gaussian_factor(temp, x_opt=37.0, width=2.0)
+    def step(grid, counter):
+        new = grid.copy()
+        new_counter = counter.copy()
 
-    # Cytodex 1 – trade-off between surface area and mass transfer
-    # Let’s say optimum ≈ 3 g/L, decent between 2–5 g/L
-    f_cyto_mu = gaussian_factor(cytodex, x_opt=3.0, width=1.5)
-    f_cyto_X = gaussian_factor(cytodex, x_opt=3.5, width=2.0)
+        for i in range(grid_size):
+            for j in range(grid_size):
 
-    # Glucose – Monod-like
-    # Assume Ks ≈ 0.5 g/L, saturates towards 1 above ~3 g/L
-    f_glu_mu = monod_factor(glucose, Ks=0.5)
-    f_glu_X = monod_factor(glucose, Ks=0.8)
+                # Growth from OCCUPIED
+                if grid[i, j] == OCCUPIED:
+                    neighbors = [(x % grid_size, y % grid_size)
+                                 for x in range(i-1, i+2)
+                                 for y in range(j-1, j+2)
+                                 if (x, y) != (i, j)]
+                    random.shuffle(neighbors)
+                    for x, y in neighbors:
+                        if new[x, y] == UNOCCUPIED:
+                            new[x, y] = NEWLY_OCCUPIED
+                            break
+                    else:
+                        new[i, j] = INHIBITED
 
-    # Glucosamine – support factor with mild overdose penalty
-    # Rough "nice" zone around 2–6 mM
-    f_glcn_mu = bounded_saturation(glucosamine, x_opt=4.0, Ks_low=1.0, Ks_high=4.0)
-    f_glcn_X = bounded_saturation(glucosamine, x_opt=4.0, Ks_low=1.5, Ks_high=5.0)
+                # Multilayer on inhibited
+                if new[i, j] == INHIBITED:
+                    neighbors = [(x % grid_size, y % grid_size)
+                                 for x in range(i-1, i+2)
+                                 for y in range(j-1, j+2)
+                                 if (x, y) != (i, j)]
+                    if any(new[x, y] in [INHIBITED, MULTILAYER] for x, y in neighbors):
+                        new_counter[i, j] += 1
+                        if new_counter[i, j] >= multilayer_threshold:
+                            new[i, j] = MULTILAYER
+                            new_counter[i, j] = 0
+                    else:
+                        new_counter[i, j] = 0
 
-    # Combine factors multiplicatively (very simplified)
-    mu_eff = mu_max * f_pH_mu * f_T_mu * f_cyto_mu * f_glu_mu * f_glcn_mu
+        return new, new_counter
 
-    # Prevent unrealistic zero μ
-    mu_eff = max(mu_eff, 1e-4)
+    for _ in range(time_steps):
+        grid, multilayer_counter = step(grid, multilayer_counter)
 
-    Xmax_eff = Xmax_base * f_pH_X * f_T_X * f_cyto_X * f_glu_X * f_glcn_X
+        # snapshot BEFORE NEWLY->OCC conversion so you can see NEWLY_OCCUPIED
+        snapshots.append(grid.copy())
 
-    # Ensure Xmax at least a bit above X0
-    Xmax_eff = max(Xmax_eff, X0 * 1.5)
+        uno = np.count_nonzero(grid == UNOCCUPIED)
+        occ = np.count_nonzero(grid == OCCUPIED)
+        newo = np.count_nonzero(grid == NEWLY_OCCUPIED)
+        inh = np.count_nonzero(grid == INHIBITED)
+        mul = np.count_nonzero(grid == MULTILAYER)
+        occ_avg = occ + newo + inh + mul
 
-    # Also return the individual factors for display
-    factors = {
-        "pH (μ)": f_pH_mu,
-        "Temp (μ)": f_T_mu,
-        "Cytodex (μ)": f_cyto_mu,
-        "Glucose (μ)": f_glu_mu,
-        "Glucosamine (μ)": f_glcn_mu,
-        "pH (Xmax)": f_pH_X,
-        "Temp (Xmax)": f_T_X,
-        "Cytodex (Xmax)": f_cyto_X,
-        "Glucose (Xmax)": f_glu_X,
-        "Glucosamine (Xmax)": f_glcn_X,
-    }
+        counts["UNOCCUPIED"].append(uno)
+        counts["OCCUPIED"].append(occ)
+        counts["NEWLY_OCCUPIED"].append(newo)
+        counts["INHIBITED"].append(inh)
+        counts["MULTILAYER"].append(mul)
+        counts["OCCUPIED_averaged"].append(occ_avg)
 
-    return mu_eff, Xmax_eff, factors
+        grid[grid == NEWLY_OCCUPIED] = OCCUPIED
 
-def logistic_growth(t, X0, mu, Xmax):
-    A = (Xmax - X0) / X0
-    return Xmax / (1.0 + A * np.exp(-mu * t))
+    return cap, counts, snapshots
 
-# -----------------------
-# CALCULATIONS
-# -----------------------
-t = np.linspace(0, t_end, n_points)
 
-mu_eff, Xmax_eff, factors = compute_mu_and_xmax(
-    pH=pH,
-    temp=temp,
-    cytodex=cytodex,
-    glucose=glucose,
-    glucosamine=glucosamine,
-    X0=X0,
-)
+@st.cache_data(show_spinner=False)
+def run_monte_carlo(
+    num_experiments: int,
+    time_steps: int,
+    max_cells_mean: float,
+    max_cells_sd: float,
+    inoc_mean: float,
+    inoc_sd: float,
+    multilayer_threshold: int,
+    seed: int | None,
+):
+    if seed is not None:
+        np.random.seed(seed)
+        random.seed(seed)
 
-X = logistic_growth(t, X0, mu_eff, Xmax_eff)
+    runs = [run_experiment(time_steps, max_cells_mean, max_cells_sd, inoc_mean, inoc_sd, multilayer_threshold)
+            for _ in range(num_experiments)]
 
-df = pd.DataFrame({"Time [h]": t, "Viable cell density [cells/mL]": X})
+    capacities = np.array([cap for cap, _, _ in runs])
+    sort_idx = np.argsort(capacities)
 
-doubling_time = np.log(2) / mu_eff
+    idx_low = int(sort_idx[0])
+    idx_med = int(sort_idx[len(sort_idx)//2])
+    idx_high = int(sort_idx[-1])
 
-# -----------------------
-# LAYOUT
-# -----------------------
-col_plot, col_stats = st.columns([2.2, 1.3])
+    return runs, capacities, idx_low, idx_med, idx_high
 
-with col_plot:
-    st.subheader("Growth curve – Vero on Cytodex 1")
-    st.line_chart(df, x="Time [h]", y="Viable cell density [cells/mL]")
 
-with col_stats:
-    st.subheader("Derived culture performance")
+# =========================
+# UI
+# =========================
+st.title("Microcarrier cellular automaton (Vero) – Monte Carlo + sphere GIFs")
 
-    st.metric("Effective μ [1/h]", f"{mu_eff:.4f}")
-    st.metric("Doubling time [h]", f"{doubling_time:.1f}")
-    st.metric("Carrying capacity Xmax [cells/mL]", f"{Xmax_eff:.3e}")
-    st.metric("Initial density X₀ [cells/mL]", f"{X0:.3e}")
+with st.sidebar:
+    st.header("Simulation controls")
 
-    st.markdown("**Factor contributions to μ (0–1):**")
-    df_mu = pd.DataFrame(
-        {
-            "Factor": ["pH", "Temperature", "Cytodex 1", "Glucose", "Glucosamine"],
-            "Contribution": [
-                factors["pH (μ)"],
-                factors["Temp (μ)"],
-                factors["Cytodex (μ)"],
-                factors["Glucose (μ)"],
-                factors["Glucosamine (μ)"],
-            ],
-        }
-    ).set_index("Factor")
-    st.bar_chart(df_mu)
+    num_experiments = st.slider("Number of Monte Carlo experiments", 10, 2000, 120, 10)
+    time_steps = st.slider("Time steps", 3, 30, 10, 1)
 
-st.markdown("---")
-st.markdown(
-    """
-### Model notes
+    st.subheader("Capacity distribution (MAX cells/MC)")
+    max_cells_mean = st.slider("Mean MAX cells/MC", 20.0, 400.0, 140.0, 1.0)
+    max_cells_sd = st.slider("SD MAX cells/MC", 0.0, 120.0, 23.0, 1.0)
 
-- **Logistic growth** is used to represent limited surface area, nutrients and waste accumulation.
-- The effective growth rate **μ** and carrying capacity **Xmax** are **heuristic functions** of pH, temperature, Cytodex 1 load,
-  glucose and glucosamine.  
-- Each variable scales μ and Xmax with a factor between 0 and 1 (Gaussian/Monod-like).
-- All shapes, optima and constants are **illustrative** and should be tuned against real experimental data if you want more realism.
+    st.subheader("Inoculation distribution (cells/MC)")
+    inoc_mean = st.slider("Mean inoculation cells/MC", 0.0, 50.0, 4.004, 0.1)
+    inoc_sd = st.slider("SD inoculation cells/MC", 0.0, 30.0, 3.0, 0.1)
 
-Use it as an educational tool on your website: show how changing pH, feed or microcarrier load can conceptually
-shift growth rate and final cell density for Vero cell cultures.
-"""
-)
+    st.subheader("Multilayer rule")
+    multilayer_threshold = st.slider("Cycles until inhibited → multilayer", 1, 10, 1, 1)
+
+    st.subheader("Reproducibility")
+    use_seed = st.checkbox("Use fixed RNG seed", value=False)
+    seed = st.number_input("Seed", min_value=0, max_value=10_000_000, value=42, step=1) if use_seed else None
+
+    run_btn = st.button("Run simulation", type="primary")
+
+
+# Auto-run once on load
+if "has_run" not in st.session_state:
+    st.session_state.has_run = True
+    run_btn = True
+
+if run_btn:
+    with st.spinner("Running Monte Carlo..."):
+        runs, capacities, idx_low, idx_med, idx_high = run_monte_carlo(
+            num_experiments=num_experiments,
+            time_steps=time_steps,
+            max_cells_mean=max_cells_mean,
+            max_cells_sd=max_cells_sd,
+            inoc_mean=inoc_mean,
+            inoc_sd=inoc_sd,
+            multilayer_threshold=multilayer_threshold,
+            seed=seed,
+        )
+
+    st.success("Done.")
+
+    # =========================
+    # Plot 1: Mean ± SD
+    # =========================
+    states_main = ["UNOCCUPIED", "OCCUPIED", "INHIBITED", "MULTILAYER"]
+    ts = np.arange(1, time_steps + 1)
+
+    avg = {s: [] for s in states_main}
+    sd = {s: [] for s in states_main}
+
+    for s in states_main:
+        for t in range(time_steps):
+            vals = [counts[s][t] for _, counts, _ in runs]
+            avg[s].append(np.mean(vals))
+            sd[s].append(np.std(vals))
+
+    fig1 = plt.figure(figsize=(8.5, 5.2))
+    ax = fig1.add_subplot(111)
+    for s in states_main:
+        ax.errorbar(ts, avg[s], yerr=sd[s], marker="o", linestyle="-", label=s)
+    ax.set_title(f"Monte Carlo mean ± SD (n={num_experiments})")
+    ax.set_xlabel("Time step")
+    ax.set_ylabel("Sites per MC")
+    ax.grid(True, linestyle="--", linewidth=0.5)
+    ax.legend()
+    st.pyplot(fig1)
+
+    # =========================
+    # Plots 2–4: Low/Median/High
+    # =========================
+    def plot_single(idx: int, label: str):
+        cap, counts, _ = runs[idx]
+        fig = plt.figure(figsize=(7.2, 4.6))
+        ax = fig.add_subplot(111)
+        for s in states_main:
+            ax.plot(ts, counts[s], marker="o", linestyle="-", label=s)
+        ax.set_title(f"{label} capacity MC (MAX≈{cap:.1f})")
+        ax.set_xlabel("Time step")
+        ax.set_ylabel("Sites per MC")
+        ax.grid(True, linestyle="--", linewidth=0.5)
+        ax.legend()
+        st.pyplot(fig)
+        return cap, counts
+
+    colA, colB, colC = st.columns(3)
+    with colA:
+        cap_low, _ = plot_single(idx_low, "LOW")
+    with colB:
+        cap_med, _ = plot_single(idx_med, "MEDIAN")
+    with colC:
+        cap_high, _ = plot_single(idx_high, "HIGH")
+
+    # =========================
+    # Sphere GIFs: low/high
+    # =========================
+    st.subheader("Sphere visualization (GIFs)")
+
+    cap_low, _, grids_low = runs[idx_low]
+    cap_high, _, grids_high = runs[idx_high]
+
+    with st.spinner("Rendering LOW and HIGH sphere GIFs..."):
+        low_gif_bytes = make_gif_from_grids(grids_low, "LOW capacity MC", cap_low, duration_s=0.8)
+        high_gif_bytes = make_gif_from_grids(grids_high, "HIGH capacity MC", cap_high, duration_s=0.8)
+
+    g1, g2 = st.columns(2)
+    with g1:
+        st.markdown(f"**LOW capacity** (MAX≈{cap_low:.1f})")
+        st.image(low_gif_bytes)
+        st.download_button(
+            "Download LOW GIF",
+            data=low_gif_bytes,
+            file_name="microcarrier_LOW_capacity.gif",
+            mime="image/gif",
+        )
+
+    with g2:
+        st.markdown(f"**HIGH capacity** (MAX≈{cap_high:.1f})")
+        st.image(high_gif_bytes)
+        st.download_button(
+            "Download HIGH GIF",
+            data=high_gif_bytes,
+            file_name="microcarrier_HIGH_capacity.gif",
+            mime="image/gif",
+        )
+
+    # =========================
+    # Optional: export aggregated data
+    # =========================
+    st.subheader("Export (optional)")
+    export_rows = []
+    for i, (cap, counts, _) in enumerate(runs):
+        row = {"experiment": i, "MAX_capacity": cap}
+        for t in range(time_steps):
+            for k in ["UNOCCUPIED","OCCUPIED","NEWLY_OCCUPIED","INHIBITED","MULTILAYER","OCCUPIED_averaged"]:
+                row[f"{k}_{t+1}"] = counts[k][t]
+        export_rows.append(row)
+    export_df = pd.DataFrame(export_rows)
+
+    csv_bytes = export_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download raw experiment table (CSV)",
+        data=csv_bytes,
+        file_name="mc_microcarrier_experiments.csv",
+        mime="text/csv",
+    )
+
+else:
+    st.info("Adjust sliders and click **Run simulation**.")

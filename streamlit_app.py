@@ -237,7 +237,7 @@ st.title("Microcarrier CA (Vero) – Monte Carlo + looping spheres + normalized 
 with st.sidebar:
     st.header("Controls (auto-runs on change)")
 
-    num_experiments = st.slider("Number of experiments", 10, 2000, 120, 10)
+    num_experiments = st.slider("Number of experiments", 10, 10000, 120, 10)
 
     st.subheader("Inoculation (cells/MC)")
     inoc_mean = st.slider("Mean inoculation (cells/MC)", 0.0, 50.0, 4.004, 0.1)

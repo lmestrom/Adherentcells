@@ -1,3 +1,7 @@
+# streamlit_app.py
+# Full app: sliders → Monte Carlo CA → mean±SD plots → low/median/high plots
+# → looping GIFs (low/median/high) → state-vs-capacity line plots for SELECTED steps
+
 import io
 import math
 import random
@@ -30,7 +34,7 @@ STATE_COLORS = np.array([
     [0.35, 0.00, 0.00, 1.0],  # MULTILAYER  dark red
 ], dtype=float)
 
-# Defaults / fixed parameters
+# Defaults / fixed parameters (you can slider these too if you want)
 TIME_STEPS = 10
 MAX_CELLS_MEAN_DEFAULT = 140.0
 MAX_CELLS_SD_DEFAULT = 23.0
@@ -91,7 +95,7 @@ def make_gif_from_grids(grids, title_prefix: str, cap_value: float, duration_s: 
         frames.append(imageio.imread(png_bytes))
 
     out = io.BytesIO()
-    # loop=0 => infinite looping GIF
+    # loop=0 => infinite looping GIF (repeats in UI)
     imageio.mimsave(out, frames, format="GIF", duration=duration_s, loop=0)
     out.seek(0)
     return out.read()
@@ -219,7 +223,7 @@ def run_monte_carlo(
 # =========================
 # UI
 # =========================
-st.title("Microcarrier cellular automaton (Vero) – sliders + Monte Carlo + sphere GIFs")
+st.title("Microcarrier cellular automaton (Vero) – Monte Carlo + looping sphere GIFs + capacity plots")
 
 with st.sidebar:
     st.header("Controls (auto-runs on change)")
@@ -258,7 +262,7 @@ st.caption(
 )
 
 # =========================
-# Plot: mean ± SD
+# Plot: mean ± SD vs time
 # =========================
 states_main = ["UNOCCUPIED", "OCCUPIED", "INHIBITED", "MULTILAYER"]
 ts = np.arange(1, TIME_STEPS + 1)
@@ -309,9 +313,9 @@ with c3:
     cap_high, _ = plot_single(idx_high, "HIGH")
 
 # =========================
-# Sphere GIFs: low / median / high
+# Sphere GIFs: low / median / high (looping)
 # =========================
-st.subheader("Sphere visualization (animated GIFs – looping)")
+st.subheader("Sphere visualization (animated looping GIFs)")
 
 cap_low, _, grids_low = runs[idx_low]
 cap_med, _, grids_med = runs[idx_med]
@@ -338,6 +342,72 @@ with g3:
     st.markdown(f"**HIGH** (MAX≈{cap_high:.1f})")
     st.image(high_gif)
     st.download_button("Download HIGH GIF", high_gif, "microcarrier_HIGH_capacity.gif", "image/gif")
+
+# =========================
+# NEW: State counts vs capacity (selected steps)
+# =========================
+st.subheader("State counts vs capacity (selected steps)")
+
+n_bins = st.slider("Capacity bins", 5, 60, 15, 1)
+
+states_for_capacity_plot = st.multiselect(
+    "States to plot vs capacity",
+    ["UNOCCUPIED", "OCCUPIED", "NEWLY_OCCUPIED", "INHIBITED", "MULTILAYER", "OCCUPIED_averaged"],
+    default=["OCCUPIED", "INHIBITED", "MULTILAYER"]
+)
+
+selected_steps = st.multiselect(
+    "Select steps to plot",
+    options=list(range(1, TIME_STEPS + 1)),
+    default=[1, max(1, TIME_STEPS // 2), TIME_STEPS]
+)
+
+selected_steps = sorted(set(selected_steps))
+
+if len(selected_steps) == 0:
+    st.warning("Select at least one step to plot.")
+else:
+    # Flat table: one row per experiment x step
+    rows = []
+    for i, (cap, counts, _) in enumerate(runs):
+        for t in range(TIME_STEPS):
+            row = {
+                "experiment": i,
+                "capacity": float(cap),
+                "step": t + 1,
+            }
+            for k in ["UNOCCUPIED","OCCUPIED","NEWLY_OCCUPIED","INHIBITED","MULTILAYER","OCCUPIED_averaged"]:
+                row[k] = counts[k][t]
+            rows.append(row)
+
+    cap_step_df = pd.DataFrame(rows)
+
+    # Bin capacities
+    cap_min = float(cap_step_df["capacity"].min())
+    cap_max = float(cap_step_df["capacity"].max())
+    bins = np.linspace(cap_min, cap_max, n_bins + 1)
+    bin_centers = 0.5 * (bins[:-1] + bins[1:])
+
+    cap_step_df["cap_bin"] = pd.cut(cap_step_df["capacity"], bins=bins, include_lowest=True)
+    bin_intervals = pd.cut(bin_centers, bins=bins, include_lowest=True).cat.categories
+
+    for state in states_for_capacity_plot:
+        fig = plt.figure(figsize=(10, 6))
+        ax = fig.add_subplot(111)
+
+        for step in selected_steps:
+            sub = cap_step_df[cap_step_df["step"] == step]
+            means_by_bin = sub.groupby("cap_bin", observed=True)[state].mean()
+            y = [float(means_by_bin.get(interval, np.nan)) for interval in bin_intervals]
+
+            ax.plot(bin_centers, y, marker="o", linestyle="-", label=f"Step {step}")
+
+        ax.set_title(f"{state}: mean count vs capacity (selected steps)")
+        ax.set_xlabel("Capacity (MAX cells/MC)")
+        ax.set_ylabel(f"Mean {state} sites")
+        ax.grid(True, linestyle="--", linewidth=0.5)
+        ax.legend(ncol=2, fontsize=9)
+        st.pyplot(fig)
 
 # =========================
 # Optional export

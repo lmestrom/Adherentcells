@@ -10,7 +10,7 @@ import imageio.v2 as imageio
 # =========================
 # Streamlit config
 # =========================
-st.set_page_config(page_title="Microcarrier CA (Vero) – Monte Carlo", layout="wide")
+st.set_page_config(page_title="Microcarrier CA – Monte Carlo", layout="wide")
 
 # =========================
 # Constants: cell states
@@ -21,15 +21,7 @@ NEWLY_OCCUPIED = 2
 INHIBITED = 3
 MULTILAYER = 4
 
-STATE_NAMES = {
-    UNOCCUPIED: "UNOCCUPIED",
-    OCCUPIED: "OCCUPIED",
-    NEWLY_OCCUPIED: "NEWLY_OCCUPIED",
-    INHIBITED: "INHIBITED",
-    MULTILAYER: "MULTILAYER",
-}
-
-# Colors (RGBA) for sphere as requested
+# Sphere colors (RGBA)
 STATE_COLORS = np.array([
     [0.83, 0.83, 0.83, 1.0],  # UNOCCUPIED  light grey
     [0.50, 0.00, 0.50, 1.0],  # OCCUPIED    purple
@@ -37,6 +29,12 @@ STATE_COLORS = np.array([
     [0.85, 0.00, 0.00, 1.0],  # INHIBITED   red
     [0.35, 0.00, 0.00, 1.0],  # MULTILAYER  dark red
 ], dtype=float)
+
+# Defaults / fixed parameters
+TIME_STEPS = 10
+MAX_CELLS_MEAN_DEFAULT = 140.0
+MAX_CELLS_SD_DEFAULT = 23.0
+MULTILAYER_THRESHOLD_DEFAULT = 1
 
 
 # =========================
@@ -52,7 +50,6 @@ def map_to_sphere(U: np.ndarray, V: np.ndarray, r: float = 1.0):
 
 
 def render_sphere_frame(grid: np.ndarray, title: str):
-    """Return a matplotlib figure for a single sphere frame."""
     fig = plt.figure(figsize=(5.2, 5.2))
     ax = fig.add_subplot(111, projection="3d")
 
@@ -87,14 +84,15 @@ def fig_to_png_bytes(fig) -> bytes:
 
 
 def make_gif_from_grids(grids, title_prefix: str, cap_value: float, duration_s: float = 0.8) -> bytes:
-    """Create GIF bytes from list of grid snapshots."""
     frames = []
     for t, grid in enumerate(grids, start=1):
         fig = render_sphere_frame(grid, f"{title_prefix} (MAX≈{cap_value:.1f}) – step {t}")
         png_bytes = fig_to_png_bytes(fig)
         frames.append(imageio.imread(png_bytes))
+
     out = io.BytesIO()
-    imageio.mimsave(out, frames, format="GIF", duration=duration_s)
+    # loop=0 => infinite looping GIF
+    imageio.mimsave(out, frames, format="GIF", duration=duration_s, loop=0)
     out.seek(0)
     return out.read()
 
@@ -110,19 +108,16 @@ def run_experiment(
     inoc_sd: float,
     multilayer_threshold: int,
 ):
-    """
-    Returns:
-      cap (float), counts_over_time (dict[str]->list), sphere_snapshots (list of grids)
-    """
     cap = max(1.0, np.random.normal(max_cells_mean, max_cells_sd))
     inoc = max(0.0, np.random.normal(inoc_mean, inoc_sd))
-    inoc_density = inoc / cap
+    inoc_density = inoc / cap  # fraction of sites seeded on this bead
 
     grid_size = max(2, int(round(math.sqrt(cap))))
     grid = np.zeros((grid_size, grid_size), dtype=int)
 
     total_sites = grid_size**2
     n_seed = min(max(int(total_sites * inoc_density), 0), total_sites)
+
     if n_seed > 0:
         for pos in random.sample(range(total_sites), n_seed):
             x, y = divmod(pos, grid_size)
@@ -140,7 +135,6 @@ def run_experiment(
         for i in range(grid_size):
             for j in range(grid_size):
 
-                # Growth from OCCUPIED
                 if grid[i, j] == OCCUPIED:
                     neighbors = [(x % grid_size, y % grid_size)
                                  for x in range(i-1, i+2)
@@ -154,7 +148,6 @@ def run_experiment(
                     else:
                         new[i, j] = INHIBITED
 
-                # Multilayer on inhibited
                 if new[i, j] == INHIBITED:
                     neighbors = [(x % grid_size, y % grid_size)
                                  for x in range(i-1, i+2)
@@ -173,7 +166,7 @@ def run_experiment(
     for _ in range(time_steps):
         grid, multilayer_counter = step(grid, multilayer_counter)
 
-        # snapshot BEFORE NEWLY->OCC conversion so you can see NEWLY_OCCUPIED
+        # snapshot BEFORE NEWLY->OCC so NEWLY is visible
         snapshots.append(grid.copy())
 
         uno = np.count_nonzero(grid == UNOCCUPIED)
@@ -226,156 +219,141 @@ def run_monte_carlo(
 # =========================
 # UI
 # =========================
-st.title("Microcarrier cellular automaton (Vero) – Monte Carlo + sphere GIFs")
+st.title("Microcarrier cellular automaton (Vero) – sliders + Monte Carlo + sphere GIFs")
 
 with st.sidebar:
-    st.header("Simulation controls")
+    st.header("Controls (auto-runs on change)")
 
-    num_experiments = st.slider("Number of Monte Carlo experiments", 10, 2000, 120, 10)
-    time_steps = st.slider("Time steps", 3, 30, 10, 1)
+    num_experiments = st.slider("Number of experiments", 10, 2000, 120, 10)
 
-    st.subheader("Capacity distribution (MAX cells/MC)")
-    max_cells_mean = st.slider("Mean MAX cells/MC", 20.0, 400.0, 140.0, 1.0)
-    max_cells_sd = st.slider("SD MAX cells/MC", 0.0, 120.0, 23.0, 1.0)
+    st.subheader("Inoculation (cells/MC)")
+    inoc_mean = st.slider("Mean inoculation (cells/MC)", 0.0, 50.0, 4.004, 0.1)
+    inoc_sd = st.slider("SD inoculation (cells/MC)", 0.0, 30.0, 3.0, 0.1)
 
-    st.subheader("Inoculation distribution (cells/MC)")
-    inoc_mean = st.slider("Mean inoculation cells/MC", 0.0, 50.0, 4.004, 0.1)
-    inoc_sd = st.slider("SD inoculation cells/MC", 0.0, 30.0, 3.0, 0.1)
+    st.subheader("Optional (advanced)")
+    with st.expander("Capacity + multilayer settings"):
+        max_cells_mean = st.slider("Mean MAX cells/MC", 20.0, 400.0, MAX_CELLS_MEAN_DEFAULT, 1.0)
+        max_cells_sd = st.slider("SD MAX cells/MC", 0.0, 120.0, MAX_CELLS_SD_DEFAULT, 1.0)
+        multilayer_threshold = st.slider("Cycles until inhibited → multilayer", 1, 10, MULTILAYER_THRESHOLD_DEFAULT, 1)
 
-    st.subheader("Multilayer rule")
-    multilayer_threshold = st.slider("Cycles until inhibited → multilayer", 1, 10, 1, 1)
-
-    st.subheader("Reproducibility")
-    use_seed = st.checkbox("Use fixed RNG seed", value=False)
+    use_seed = st.checkbox("Use fixed seed (reproducible)", value=False)
     seed = st.number_input("Seed", min_value=0, max_value=10_000_000, value=42, step=1) if use_seed else None
 
-    run_btn = st.button("Run simulation", type="primary")
+# run (auto)
+with st.spinner("Running Monte Carlo..."):
+    runs, capacities, idx_low, idx_med, idx_high = run_monte_carlo(
+        num_experiments=num_experiments,
+        time_steps=TIME_STEPS,
+        max_cells_mean=max_cells_mean,
+        max_cells_sd=max_cells_sd,
+        inoc_mean=inoc_mean,
+        inoc_sd=inoc_sd,
+        multilayer_threshold=multilayer_threshold,
+        seed=seed,
+    )
 
+st.caption(
+    f"Steps={TIME_STEPS} | MAX cells/MC ~ N({max_cells_mean:.1f}, {max_cells_sd:.1f}) | "
+    f"Inoc ~ N({inoc_mean:.3f}, {inoc_sd:.3f}) | multilayer threshold={multilayer_threshold}"
+)
 
-# Auto-run once on load
-if "has_run" not in st.session_state:
-    st.session_state.has_run = True
-    run_btn = True
+# =========================
+# Plot: mean ± SD
+# =========================
+states_main = ["UNOCCUPIED", "OCCUPIED", "INHIBITED", "MULTILAYER"]
+ts = np.arange(1, TIME_STEPS + 1)
 
-if run_btn:
-    with st.spinner("Running Monte Carlo..."):
-        runs, capacities, idx_low, idx_med, idx_high = run_monte_carlo(
-            num_experiments=num_experiments,
-            time_steps=time_steps,
-            max_cells_mean=max_cells_mean,
-            max_cells_sd=max_cells_sd,
-            inoc_mean=inoc_mean,
-            inoc_sd=inoc_sd,
-            multilayer_threshold=multilayer_threshold,
-            seed=seed,
-        )
+avg = {s: [] for s in states_main}
+sdv = {s: [] for s in states_main}
 
-    st.success("Done.")
+for s in states_main:
+    for t in range(TIME_STEPS):
+        vals = [counts[s][t] for _, counts, _ in runs]
+        avg[s].append(np.mean(vals))
+        sdv[s].append(np.std(vals))
 
-    # =========================
-    # Plot 1: Mean ± SD
-    # =========================
-    states_main = ["UNOCCUPIED", "OCCUPIED", "INHIBITED", "MULTILAYER"]
-    ts = np.arange(1, time_steps + 1)
+fig1 = plt.figure(figsize=(9, 5.2))
+ax = fig1.add_subplot(111)
+for s in states_main:
+    ax.errorbar(ts, avg[s], yerr=sdv[s], marker="o", linestyle="-", label=s)
+ax.set_title(f"Monte Carlo mean ± SD (n={num_experiments})")
+ax.set_xlabel("Time step")
+ax.set_ylabel("Sites per MC")
+ax.grid(True, linestyle="--", linewidth=0.5)
+ax.legend()
+st.pyplot(fig1)
 
-    avg = {s: [] for s in states_main}
-    sd = {s: [] for s in states_main}
-
+# =========================
+# Low / Median / High plots
+# =========================
+def plot_single(idx: int, label: str):
+    cap, counts, _ = runs[idx]
+    fig = plt.figure(figsize=(7.2, 4.6))
+    ax = fig.add_subplot(111)
     for s in states_main:
-        for t in range(time_steps):
-            vals = [counts[s][t] for _, counts, _ in runs]
-            avg[s].append(np.mean(vals))
-            sd[s].append(np.std(vals))
-
-    fig1 = plt.figure(figsize=(8.5, 5.2))
-    ax = fig1.add_subplot(111)
-    for s in states_main:
-        ax.errorbar(ts, avg[s], yerr=sd[s], marker="o", linestyle="-", label=s)
-    ax.set_title(f"Monte Carlo mean ± SD (n={num_experiments})")
+        ax.plot(ts, counts[s], marker="o", linestyle="-", label=s)
+    ax.set_title(f"{label} capacity MC (MAX≈{cap:.1f})")
     ax.set_xlabel("Time step")
     ax.set_ylabel("Sites per MC")
     ax.grid(True, linestyle="--", linewidth=0.5)
     ax.legend()
-    st.pyplot(fig1)
+    st.pyplot(fig)
+    return cap, counts
 
-    # =========================
-    # Plots 2–4: Low/Median/High
-    # =========================
-    def plot_single(idx: int, label: str):
-        cap, counts, _ = runs[idx]
-        fig = plt.figure(figsize=(7.2, 4.6))
-        ax = fig.add_subplot(111)
-        for s in states_main:
-            ax.plot(ts, counts[s], marker="o", linestyle="-", label=s)
-        ax.set_title(f"{label} capacity MC (MAX≈{cap:.1f})")
-        ax.set_xlabel("Time step")
-        ax.set_ylabel("Sites per MC")
-        ax.grid(True, linestyle="--", linewidth=0.5)
-        ax.legend()
-        st.pyplot(fig)
-        return cap, counts
+c1, c2, c3 = st.columns(3)
+with c1:
+    cap_low, _ = plot_single(idx_low, "LOW")
+with c2:
+    cap_med, _ = plot_single(idx_med, "MEDIAN")
+with c3:
+    cap_high, _ = plot_single(idx_high, "HIGH")
 
-    colA, colB, colC = st.columns(3)
-    with colA:
-        cap_low, _ = plot_single(idx_low, "LOW")
-    with colB:
-        cap_med, _ = plot_single(idx_med, "MEDIAN")
-    with colC:
-        cap_high, _ = plot_single(idx_high, "HIGH")
+# =========================
+# Sphere GIFs: low / median / high
+# =========================
+st.subheader("Sphere visualization (animated GIFs – looping)")
 
-    # =========================
-    # Sphere GIFs: low/high
-    # =========================
-    st.subheader("Sphere visualization (GIFs)")
+cap_low, _, grids_low = runs[idx_low]
+cap_med, _, grids_med = runs[idx_med]
+cap_high, _, grids_high = runs[idx_high]
 
-    cap_low, _, grids_low = runs[idx_low]
-    cap_high, _, grids_high = runs[idx_high]
+with st.spinner("Rendering sphere GIFs (LOW / MEDIAN / HIGH)..."):
+    low_gif = make_gif_from_grids(grids_low, "LOW capacity MC", cap_low, duration_s=0.8)
+    med_gif = make_gif_from_grids(grids_med, "MEDIAN capacity MC", cap_med, duration_s=0.8)
+    high_gif = make_gif_from_grids(grids_high, "HIGH capacity MC", cap_high, duration_s=0.8)
 
-    with st.spinner("Rendering LOW and HIGH sphere GIFs..."):
-        low_gif_bytes = make_gif_from_grids(grids_low, "LOW capacity MC", cap_low, duration_s=0.8)
-        high_gif_bytes = make_gif_from_grids(grids_high, "HIGH capacity MC", cap_high, duration_s=0.8)
+g1, g2, g3 = st.columns(3)
 
-    g1, g2 = st.columns(2)
-    with g1:
-        st.markdown(f"**LOW capacity** (MAX≈{cap_low:.1f})")
-        st.image(low_gif_bytes)
-        st.download_button(
-            "Download LOW GIF",
-            data=low_gif_bytes,
-            file_name="microcarrier_LOW_capacity.gif",
-            mime="image/gif",
-        )
+with g1:
+    st.markdown(f"**LOW** (MAX≈{cap_low:.1f})")
+    st.image(low_gif)
+    st.download_button("Download LOW GIF", low_gif, "microcarrier_LOW_capacity.gif", "image/gif")
 
-    with g2:
-        st.markdown(f"**HIGH capacity** (MAX≈{cap_high:.1f})")
-        st.image(high_gif_bytes)
-        st.download_button(
-            "Download HIGH GIF",
-            data=high_gif_bytes,
-            file_name="microcarrier_HIGH_capacity.gif",
-            mime="image/gif",
-        )
+with g2:
+    st.markdown(f"**MEDIAN** (MAX≈{cap_med:.1f})")
+    st.image(med_gif)
+    st.download_button("Download MEDIAN GIF", med_gif, "microcarrier_MEDIAN_capacity.gif", "image/gif")
 
-    # =========================
-    # Optional: export aggregated data
-    # =========================
-    st.subheader("Export (optional)")
-    export_rows = []
+with g3:
+    st.markdown(f"**HIGH** (MAX≈{cap_high:.1f})")
+    st.image(high_gif)
+    st.download_button("Download HIGH GIF", high_gif, "microcarrier_HIGH_capacity.gif", "image/gif")
+
+# =========================
+# Optional export
+# =========================
+with st.expander("Export raw experiment table (CSV)"):
+    rows = []
     for i, (cap, counts, _) in enumerate(runs):
-        row = {"experiment": i, "MAX_capacity": cap}
-        for t in range(time_steps):
+        r = {"experiment": i, "MAX_capacity": cap}
+        for t in range(TIME_STEPS):
             for k in ["UNOCCUPIED","OCCUPIED","NEWLY_OCCUPIED","INHIBITED","MULTILAYER","OCCUPIED_averaged"]:
-                row[f"{k}_{t+1}"] = counts[k][t]
-        export_rows.append(row)
-    export_df = pd.DataFrame(export_rows)
-
-    csv_bytes = export_df.to_csv(index=False).encode("utf-8")
+                r[f"{k}_{t+1}"] = counts[k][t]
+        rows.append(r)
+    df = pd.DataFrame(rows)
     st.download_button(
-        "Download raw experiment table (CSV)",
-        data=csv_bytes,
-        file_name="mc_microcarrier_experiments.csv",
-        mime="text/csv",
+        "Download CSV",
+        df.to_csv(index=False).encode("utf-8"),
+        "mc_microcarrier_experiments.csv",
+        "text/csv",
     )
-
-else:
-    st.info("Adjust sliders and click **Run simulation**.")

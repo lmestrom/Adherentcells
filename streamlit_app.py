@@ -1,6 +1,12 @@
 # streamlit_app.py
-# Full app: sliders → Monte Carlo CA → mean±SD plots → low/median/high plots
-# → looping GIFs (low/median/high) → state-vs-capacity line plots for SELECTED steps
+# Full app:
+# - Sliders for #experiments + inoculation mean/SD (auto-runs)
+# - Monte Carlo CA simulation (UNOCCUPIED/OCCUPIED/NEWLY/INHIBITED/MULTILAYER)
+# - Mean±SD vs time plot
+# - Low/Median/High single-run time plots
+# - Looping sphere GIFs for Low/Median/High
+# - State vs capacity line plots for SELECTED steps
+#   (normalized Y-axis: fraction of capacity, not absolute sites)
 
 import io
 import math
@@ -25,7 +31,7 @@ NEWLY_OCCUPIED = 2
 INHIBITED = 3
 MULTILAYER = 4
 
-# Sphere colors (RGBA)
+# Sphere colors (RGBA) – requested palette
 STATE_COLORS = np.array([
     [0.83, 0.83, 0.83, 1.0],  # UNOCCUPIED  light grey
     [0.50, 0.00, 0.50, 1.0],  # OCCUPIED    purple
@@ -34,11 +40,14 @@ STATE_COLORS = np.array([
     [0.35, 0.00, 0.00, 1.0],  # MULTILAYER  dark red
 ], dtype=float)
 
-# Defaults / fixed parameters (you can slider these too if you want)
+# Fixed defaults (you can slider these too if you want)
 TIME_STEPS = 10
 MAX_CELLS_MEAN_DEFAULT = 140.0
 MAX_CELLS_SD_DEFAULT = 23.0
 MULTILAYER_THRESHOLD_DEFAULT = 1
+
+ALL_KEYS = ["UNOCCUPIED","OCCUPIED","NEWLY_OCCUPIED","INHIBITED","MULTILAYER","OCCUPIED_averaged"]
+MAIN_KEYS = ["UNOCCUPIED","OCCUPIED","INHIBITED","MULTILAYER"]
 
 
 # =========================
@@ -95,7 +104,7 @@ def make_gif_from_grids(grids, title_prefix: str, cap_value: float, duration_s: 
         frames.append(imageio.imread(png_bytes))
 
     out = io.BytesIO()
-    # loop=0 => infinite looping GIF (repeats in UI)
+    # loop=0 => infinite looping GIF
     imageio.mimsave(out, frames, format="GIF", duration=duration_s, loop=0)
     out.seek(0)
     return out.read()
@@ -114,7 +123,7 @@ def run_experiment(
 ):
     cap = max(1.0, np.random.normal(max_cells_mean, max_cells_sd))
     inoc = max(0.0, np.random.normal(inoc_mean, inoc_sd))
-    inoc_density = inoc / cap  # fraction of sites seeded on this bead
+    inoc_density = inoc / cap  # fraction of sites seeded on bead
 
     grid_size = max(2, int(round(math.sqrt(cap))))
     grid = np.zeros((grid_size, grid_size), dtype=int)
@@ -130,7 +139,7 @@ def run_experiment(
     multilayer_counter = np.zeros_like(grid)
     snapshots = []
 
-    counts = {k: [] for k in ["UNOCCUPIED","OCCUPIED","NEWLY_OCCUPIED","INHIBITED","MULTILAYER","OCCUPIED_averaged"]}
+    counts = {k: [] for k in ALL_KEYS}
 
     def step(grid, counter):
         new = grid.copy()
@@ -223,7 +232,7 @@ def run_monte_carlo(
 # =========================
 # UI
 # =========================
-st.title("Microcarrier cellular automaton (Vero) – Monte Carlo + looping sphere GIFs + capacity plots")
+st.title("Microcarrier CA (Vero) – Monte Carlo + looping spheres + normalized capacity plots")
 
 with st.sidebar:
     st.header("Controls (auto-runs on change)")
@@ -243,7 +252,7 @@ with st.sidebar:
     use_seed = st.checkbox("Use fixed seed (reproducible)", value=False)
     seed = st.number_input("Seed", min_value=0, max_value=10_000_000, value=42, step=1) if use_seed else None
 
-# run (auto)
+# Run (auto)
 with st.spinner("Running Monte Carlo..."):
     runs, capacities, idx_low, idx_med, idx_high = run_monte_carlo(
         num_experiments=num_experiments,
@@ -257,20 +266,19 @@ with st.spinner("Running Monte Carlo..."):
     )
 
 st.caption(
-    f"Steps={TIME_STEPS} | MAX cells/MC ~ N({max_cells_mean:.1f}, {max_cells_sd:.1f}) | "
-    f"Inoc ~ N({inoc_mean:.3f}, {inoc_sd:.3f}) | multilayer threshold={multilayer_threshold}"
+    f"Steps={TIME_STEPS} | MAX~N({max_cells_mean:.1f},{max_cells_sd:.1f}) | "
+    f"Inoc~N({inoc_mean:.3f},{inoc_sd:.3f}) | multilayer threshold={multilayer_threshold}"
 )
 
 # =========================
 # Plot: mean ± SD vs time
 # =========================
-states_main = ["UNOCCUPIED", "OCCUPIED", "INHIBITED", "MULTILAYER"]
 ts = np.arange(1, TIME_STEPS + 1)
 
-avg = {s: [] for s in states_main}
-sdv = {s: [] for s in states_main}
+avg = {s: [] for s in MAIN_KEYS}
+sdv = {s: [] for s in MAIN_KEYS}
 
-for s in states_main:
+for s in MAIN_KEYS:
     for t in range(TIME_STEPS):
         vals = [counts[s][t] for _, counts, _ in runs]
         avg[s].append(np.mean(vals))
@@ -278,7 +286,7 @@ for s in states_main:
 
 fig1 = plt.figure(figsize=(9, 5.2))
 ax = fig1.add_subplot(111)
-for s in states_main:
+for s in MAIN_KEYS:
     ax.errorbar(ts, avg[s], yerr=sdv[s], marker="o", linestyle="-", label=s)
 ax.set_title(f"Monte Carlo mean ± SD (n={num_experiments})")
 ax.set_xlabel("Time step")
@@ -294,7 +302,7 @@ def plot_single(idx: int, label: str):
     cap, counts, _ = runs[idx]
     fig = plt.figure(figsize=(7.2, 4.6))
     ax = fig.add_subplot(111)
-    for s in states_main:
+    for s in MAIN_KEYS:
         ax.plot(ts, counts[s], marker="o", linestyle="-", label=s)
     ax.set_title(f"{label} capacity MC (MAX≈{cap:.1f})")
     ax.set_xlabel("Time step")
@@ -315,7 +323,7 @@ with c3:
 # =========================
 # Sphere GIFs: low / median / high (looping)
 # =========================
-st.subheader("Sphere visualization (animated looping GIFs)")
+st.subheader("Sphere visualization (looping GIFs)")
 
 cap_low, _, grids_low = runs[idx_low]
 cap_med, _, grids_med = runs[idx_med]
@@ -327,32 +335,29 @@ with st.spinner("Rendering sphere GIFs (LOW / MEDIAN / HIGH)..."):
     high_gif = make_gif_from_grids(grids_high, "HIGH capacity MC", cap_high, duration_s=0.8)
 
 g1, g2, g3 = st.columns(3)
-
 with g1:
     st.markdown(f"**LOW** (MAX≈{cap_low:.1f})")
     st.image(low_gif)
     st.download_button("Download LOW GIF", low_gif, "microcarrier_LOW_capacity.gif", "image/gif")
-
 with g2:
     st.markdown(f"**MEDIAN** (MAX≈{cap_med:.1f})")
     st.image(med_gif)
     st.download_button("Download MEDIAN GIF", med_gif, "microcarrier_MEDIAN_capacity.gif", "image/gif")
-
 with g3:
     st.markdown(f"**HIGH** (MAX≈{cap_high:.1f})")
     st.image(high_gif)
     st.download_button("Download HIGH GIF", high_gif, "microcarrier_HIGH_capacity.gif", "image/gif")
 
 # =========================
-# NEW: State counts vs capacity (selected steps)
+# State vs capacity plots (selected steps) – NORMALIZED Y AXIS
 # =========================
-st.subheader("State counts vs capacity (selected steps)")
+st.subheader("State vs capacity (selected steps, normalized by capacity)")
 
 n_bins = st.slider("Capacity bins", 5, 60, 15, 1)
 
 states_for_capacity_plot = st.multiselect(
     "States to plot vs capacity",
-    ["UNOCCUPIED", "OCCUPIED", "NEWLY_OCCUPIED", "INHIBITED", "MULTILAYER", "OCCUPIED_averaged"],
+    ALL_KEYS,
     default=["OCCUPIED", "INHIBITED", "MULTILAYER"]
 )
 
@@ -371,12 +376,8 @@ else:
     rows = []
     for i, (cap, counts, _) in enumerate(runs):
         for t in range(TIME_STEPS):
-            row = {
-                "experiment": i,
-                "capacity": float(cap),
-                "step": t + 1,
-            }
-            for k in ["UNOCCUPIED","OCCUPIED","NEWLY_OCCUPIED","INHIBITED","MULTILAYER","OCCUPIED_averaged"]:
+            row = {"experiment": i, "capacity": float(cap), "step": t + 1}
+            for k in ALL_KEYS:
                 row[k] = counts[k][t]
             rows.append(row)
 
@@ -389,6 +390,8 @@ else:
     bin_centers = 0.5 * (bins[:-1] + bins[1:])
 
     cap_step_df["cap_bin"] = pd.cut(cap_step_df["capacity"], bins=bins, include_lowest=True)
+
+    # IMPORTANT: get bin intervals from the Series (avoids the .cat error you saw)
     bin_intervals = cap_step_df["cap_bin"].cat.categories
 
     for state in states_for_capacity_plot:
@@ -397,16 +400,33 @@ else:
 
         for step in selected_steps:
             sub = cap_step_df[cap_step_df["step"] == step]
-            means_by_bin = sub.groupby("cap_bin", observed=True)[state].mean()
-            y = [float(means_by_bin.get(interval, np.nan)) for interval in bin_intervals]
+
+            # Mean state count per bin and mean capacity per bin
+            mean_state_by_bin = sub.groupby("cap_bin", observed=True)[state].mean()
+            mean_cap_by_bin = sub.groupby("cap_bin", observed=True)["capacity"].mean()
+
+            # Normalize Y by mean capacity in bin
+            y = []
+            for interval in bin_intervals:
+                mean_state = mean_state_by_bin.get(interval, np.nan)
+                mean_cap = mean_cap_by_bin.get(interval, np.nan)
+
+                if pd.isna(mean_state) or pd.isna(mean_cap) or mean_cap == 0:
+                    y.append(np.nan)
+                else:
+                    y.append(mean_state / mean_cap)
 
             ax.plot(bin_centers, y, marker="o", linestyle="-", label=f"Step {step}")
 
-        ax.set_title(f"{state}: mean count vs capacity (selected steps)")
+        ax.set_title(f"{state}: fraction of capacity vs capacity (selected steps)")
         ax.set_xlabel("Capacity (MAX cells/MC)")
-        ax.set_ylabel(f"Mean {state} sites")
+        ax.set_ylabel(f"Fraction of capacity in {state}")
         ax.grid(True, linestyle="--", linewidth=0.5)
         ax.legend(ncol=2, fontsize=9)
+
+        # Often helpful to anchor at 0 for fractions
+        ax.set_ylim(0, None)
+
         st.pyplot(fig)
 
 # =========================
@@ -417,9 +437,10 @@ with st.expander("Export raw experiment table (CSV)"):
     for i, (cap, counts, _) in enumerate(runs):
         r = {"experiment": i, "MAX_capacity": cap}
         for t in range(TIME_STEPS):
-            for k in ["UNOCCUPIED","OCCUPIED","NEWLY_OCCUPIED","INHIBITED","MULTILAYER","OCCUPIED_averaged"]:
+            for k in ALL_KEYS:
                 r[f"{k}_{t+1}"] = counts[k][t]
         rows.append(r)
+
     df = pd.DataFrame(rows)
     st.download_button(
         "Download CSV",

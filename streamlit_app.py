@@ -1,12 +1,17 @@
 # streamlit_app.py
 # Full app:
-# - Sliders for #experiments + inoculation mean/SD (auto-runs)
+# - Sliders (auto-runs): #experiments (up to 10,000), inoculation mean/SD
 # - Monte Carlo CA simulation (UNOCCUPIED/OCCUPIED/NEWLY/INHIBITED/MULTILAYER)
 # - Mean±SD vs time plot
+# - Monolayer-accessible (infectable) metrics per step:
+#     INFECTABLE = OCCUPIED + NEWLY_OCCUPIED + INHIBITED   (excludes MULTILAYER)
+#     INFECTABLE_FRAC = INFECTABLE / total_surface_sites
+#   + plots (mean±SD) for both
 # - Low/Median/High single-run time plots
 # - Looping sphere GIFs for Low/Median/High
 # - State vs capacity line plots for SELECTED steps
 #   (normalized Y-axis: fraction of capacity, not absolute sites)
+# - Optional export CSV of all per-step metrics
 
 import io
 import math
@@ -40,14 +45,25 @@ STATE_COLORS = np.array([
     [0.35, 0.00, 0.00, 1.0],  # MULTILAYER  dark red
 ], dtype=float)
 
-# Fixed defaults (you can slider these too if you want)
+# Defaults / fixed parameters (can be slid under "advanced")
 TIME_STEPS = 10
 MAX_CELLS_MEAN_DEFAULT = 140.0
 MAX_CELLS_SD_DEFAULT = 23.0
 MULTILAYER_THRESHOLD_DEFAULT = 1
 
-ALL_KEYS = ["UNOCCUPIED","OCCUPIED","NEWLY_OCCUPIED","INHIBITED","MULTILAYER","OCCUPIED_averaged"]
-MAIN_KEYS = ["UNOCCUPIED","OCCUPIED","INHIBITED","MULTILAYER"]
+# All metrics we store per step
+ALL_KEYS = [
+    "UNOCCUPIED",
+    "OCCUPIED",
+    "NEWLY_OCCUPIED",
+    "INHIBITED",
+    "MULTILAYER",
+    "OCCUPIED_averaged",
+    "INFECTABLE",
+    "INFECTABLE_FRAC",
+]
+# Main (simple) states for the first time-course plots
+MAIN_KEYS = ["UNOCCUPIED", "OCCUPIED", "INHIBITED", "MULTILAYER"]
 
 
 # =========================
@@ -121,6 +137,10 @@ def run_experiment(
     inoc_sd: float,
     multilayer_threshold: int,
 ):
+    """
+    Returns:
+      cap (float), counts(dict[str]->list), snapshots(list[grid] length=time_steps)
+    """
     cap = max(1.0, np.random.normal(max_cells_mean, max_cells_sd))
     inoc = max(0.0, np.random.normal(inoc_mean, inoc_sd))
     inoc_density = inoc / cap  # fraction of sites seeded on bead
@@ -148,11 +168,14 @@ def run_experiment(
         for i in range(grid_size):
             for j in range(grid_size):
 
+                # Growth from OCCUPIED to an adjacent UNOCCUPIED; otherwise become INHIBITED
                 if grid[i, j] == OCCUPIED:
-                    neighbors = [(x % grid_size, y % grid_size)
-                                 for x in range(i-1, i+2)
-                                 for y in range(j-1, j+2)
-                                 if (x, y) != (i, j)]
+                    neighbors = [
+                        (x % grid_size, y % grid_size)
+                        for x in range(i - 1, i + 2)
+                        for y in range(j - 1, j + 2)
+                        if (x, y) != (i, j)
+                    ]
                     random.shuffle(neighbors)
                     for x, y in neighbors:
                         if new[x, y] == UNOCCUPIED:
@@ -161,11 +184,14 @@ def run_experiment(
                     else:
                         new[i, j] = INHIBITED
 
+                # Multilayer rule on inhibited
                 if new[i, j] == INHIBITED:
-                    neighbors = [(x % grid_size, y % grid_size)
-                                 for x in range(i-1, i+2)
-                                 for y in range(j-1, j+2)
-                                 if (x, y) != (i, j)]
+                    neighbors = [
+                        (x % grid_size, y % grid_size)
+                        for x in range(i - 1, i + 2)
+                        for y in range(j - 1, j + 2)
+                        if (x, y) != (i, j)
+                    ]
                     if any(new[x, y] in [INHIBITED, MULTILAYER] for x, y in neighbors):
                         new_counter[i, j] += 1
                         if new_counter[i, j] >= multilayer_threshold:
@@ -179,7 +205,7 @@ def run_experiment(
     for _ in range(time_steps):
         grid, multilayer_counter = step(grid, multilayer_counter)
 
-        # snapshot BEFORE NEWLY->OCC so NEWLY is visible
+        # snapshot BEFORE NEWLY->OCC conversion so NEWLY is visible
         snapshots.append(grid.copy())
 
         uno = np.count_nonzero(grid == UNOCCUPIED)
@@ -187,7 +213,12 @@ def run_experiment(
         newo = np.count_nonzero(grid == NEWLY_OCCUPIED)
         inh = np.count_nonzero(grid == INHIBITED)
         mul = np.count_nonzero(grid == MULTILAYER)
+
         occ_avg = occ + newo + inh + mul
+
+        # Monolayer-accessible (infectable): OCC + NEW + INH (exclude MULTILAYER)
+        infectable = occ + newo + inh
+        infectable_frac = infectable / total_sites
 
         counts["UNOCCUPIED"].append(uno)
         counts["OCCUPIED"].append(occ)
@@ -195,13 +226,16 @@ def run_experiment(
         counts["INHIBITED"].append(inh)
         counts["MULTILAYER"].append(mul)
         counts["OCCUPIED_averaged"].append(occ_avg)
+        counts["INFECTABLE"].append(infectable)
+        counts["INFECTABLE_FRAC"].append(infectable_frac)
 
+        # advance NEWLY -> OCCUPIED
         grid[grid == NEWLY_OCCUPIED] = OCCUPIED
 
     return cap, counts, snapshots
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=5)
 def run_monte_carlo(
     num_experiments: int,
     time_steps: int,
@@ -216,14 +250,23 @@ def run_monte_carlo(
         np.random.seed(seed)
         random.seed(seed)
 
-    runs = [run_experiment(time_steps, max_cells_mean, max_cells_sd, inoc_mean, inoc_sd, multilayer_threshold)
-            for _ in range(num_experiments)]
+    runs = [
+        run_experiment(
+            time_steps=time_steps,
+            max_cells_mean=max_cells_mean,
+            max_cells_sd=max_cells_sd,
+            inoc_mean=inoc_mean,
+            inoc_sd=inoc_sd,
+            multilayer_threshold=multilayer_threshold,
+        )
+        for _ in range(num_experiments)
+    ]
 
     capacities = np.array([cap for cap, _, _ in runs])
     sort_idx = np.argsort(capacities)
 
     idx_low = int(sort_idx[0])
-    idx_med = int(sort_idx[len(sort_idx)//2])
+    idx_med = int(sort_idx[len(sort_idx) // 2])
     idx_high = int(sort_idx[-1])
 
     return runs, capacities, idx_low, idx_med, idx_high
@@ -237,6 +280,7 @@ st.title("Microcarrier CA (Vero) – Monte Carlo + looping spheres + normalized 
 with st.sidebar:
     st.header("Controls (auto-runs on change)")
 
+    # ✅ max experiments increased to 10,000
     num_experiments = st.slider("Number of experiments", 10, 10000, 120, 10)
 
     st.subheader("Inoculation (cells/MC)")
@@ -251,6 +295,9 @@ with st.sidebar:
 
     use_seed = st.checkbox("Use fixed seed (reproducible)", value=False)
     seed = st.number_input("Seed", min_value=0, max_value=10_000_000, value=42, step=1) if use_seed else None
+
+    # Optional: rendering GIFs costs time; keep default True
+    render_gifs = st.checkbox("Render sphere GIFs", value=True)
 
 # Run (auto)
 with st.spinner("Running Monte Carlo..."):
@@ -271,7 +318,7 @@ st.caption(
 )
 
 # =========================
-# Plot: mean ± SD vs time
+# Plot: mean ± SD vs time (main states)
 # =========================
 ts = np.arange(1, TIME_STEPS + 1)
 
@@ -296,7 +343,47 @@ ax.legend()
 st.pyplot(fig1)
 
 # =========================
-# Low / Median / High plots
+# NEW: Infectable plots (mean ± SD)
+# =========================
+st.subheader("Monolayer-accessible (infectable) cells over time")
+
+infectable_vals_by_t = []
+infectable_frac_vals_by_t = []
+for t in range(TIME_STEPS):
+    infectable_vals_by_t.append([counts["INFECTABLE"][t] for _, counts, _ in runs])
+    infectable_frac_vals_by_t.append([counts["INFECTABLE_FRAC"][t] for _, counts, _ in runs])
+
+infectable_mean = [np.mean(v) for v in infectable_vals_by_t]
+infectable_sd = [np.std(v) for v in infectable_vals_by_t]
+
+infectable_frac_mean = [np.mean(v) for v in infectable_frac_vals_by_t]
+infectable_frac_sd = [np.std(v) for v in infectable_frac_vals_by_t]
+
+cA, cB = st.columns(2)
+
+with cA:
+    fig = plt.figure(figsize=(7.6, 4.6))
+    ax = fig.add_subplot(111)
+    ax.errorbar(range(1, TIME_STEPS + 1), infectable_mean, yerr=infectable_sd, marker="o")
+    ax.set_title("INFECTABLE = OCCUPIED + NEWLY + INHIBITED (mean ± SD)")
+    ax.set_xlabel("Time step")
+    ax.set_ylabel("Cells (monolayer-accessible)")
+    ax.grid(True, linestyle="--", linewidth=0.5)
+    st.pyplot(fig)
+
+with cB:
+    fig = plt.figure(figsize=(7.6, 4.6))
+    ax = fig.add_subplot(111)
+    ax.errorbar(range(1, TIME_STEPS + 1), infectable_frac_mean, yerr=infectable_frac_sd, marker="o")
+    ax.set_title("INFECTABLE fraction of surface (mean ± SD)")
+    ax.set_xlabel("Time step")
+    ax.set_ylabel("Fraction of total surface sites")
+    ax.set_ylim(0, 1.05)
+    ax.grid(True, linestyle="--", linewidth=0.5)
+    st.pyplot(fig)
+
+# =========================
+# Low / Median / High plots (single runs)
 # =========================
 def plot_single(idx: int, label: str):
     cap, counts, _ = runs[idx]
@@ -323,42 +410,43 @@ with c3:
 # =========================
 # Sphere GIFs: low / median / high (looping)
 # =========================
-st.subheader("Sphere visualization (looping GIFs)")
+if render_gifs:
+    st.subheader("Sphere visualization (looping GIFs)")
 
-cap_low, _, grids_low = runs[idx_low]
-cap_med, _, grids_med = runs[idx_med]
-cap_high, _, grids_high = runs[idx_high]
+    cap_low, _, grids_low = runs[idx_low]
+    cap_med, _, grids_med = runs[idx_med]
+    cap_high, _, grids_high = runs[idx_high]
 
-with st.spinner("Rendering sphere GIFs (LOW / MEDIAN / HIGH)..."):
-    low_gif = make_gif_from_grids(grids_low, "LOW capacity MC", cap_low, duration_s=0.8)
-    med_gif = make_gif_from_grids(grids_med, "MEDIAN capacity MC", cap_med, duration_s=0.8)
-    high_gif = make_gif_from_grids(grids_high, "HIGH capacity MC", cap_high, duration_s=0.8)
+    with st.spinner("Rendering sphere GIFs (LOW / MEDIAN / HIGH)..."):
+        low_gif = make_gif_from_grids(grids_low, "LOW capacity MC", cap_low, duration_s=0.8)
+        med_gif = make_gif_from_grids(grids_med, "MEDIAN capacity MC", cap_med, duration_s=0.8)
+        high_gif = make_gif_from_grids(grids_high, "HIGH capacity MC", cap_high, duration_s=0.8)
 
-g1, g2, g3 = st.columns(3)
-with g1:
-    st.markdown(f"**LOW** (MAX≈{cap_low:.1f})")
-    st.image(low_gif)
-    st.download_button("Download LOW GIF", low_gif, "microcarrier_LOW_capacity.gif", "image/gif")
-with g2:
-    st.markdown(f"**MEDIAN** (MAX≈{cap_med:.1f})")
-    st.image(med_gif)
-    st.download_button("Download MEDIAN GIF", med_gif, "microcarrier_MEDIAN_capacity.gif", "image/gif")
-with g3:
-    st.markdown(f"**HIGH** (MAX≈{cap_high:.1f})")
-    st.image(high_gif)
-    st.download_button("Download HIGH GIF", high_gif, "microcarrier_HIGH_capacity.gif", "image/gif")
+    g1, g2, g3 = st.columns(3)
+    with g1:
+        st.markdown(f"**LOW** (MAX≈{cap_low:.1f})")
+        st.image(low_gif)
+        st.download_button("Download LOW GIF", low_gif, "microcarrier_LOW_capacity.gif", "image/gif")
+    with g2:
+        st.markdown(f"**MEDIAN** (MAX≈{cap_med:.1f})")
+        st.image(med_gif)
+        st.download_button("Download MEDIAN GIF", med_gif, "microcarrier_MEDIAN_capacity.gif", "image/gif")
+    with g3:
+        st.markdown(f"**HIGH** (MAX≈{cap_high:.1f})")
+        st.image(high_gif)
+        st.download_button("Download HIGH GIF", high_gif, "microcarrier_HIGH_capacity.gif", "image/gif")
 
 # =========================
-# State vs capacity plots (selected steps) – NORMALIZED Y AXIS
+# State vs capacity plots (selected steps) – NORMALIZED Y AXIS (fraction of capacity)
 # =========================
 st.subheader("State vs capacity (selected steps, normalized by capacity)")
 
 n_bins = st.slider("Capacity bins", 5, 60, 15, 1)
 
 states_for_capacity_plot = st.multiselect(
-    "States to plot vs capacity",
+    "Metrics to plot vs capacity",
     ALL_KEYS,
-    default=["OCCUPIED", "INHIBITED", "MULTILAYER"]
+    default=["OCCUPIED", "INHIBITED", "MULTILAYER", "INFECTABLE"]
 )
 
 selected_steps = st.multiselect(
@@ -366,7 +454,6 @@ selected_steps = st.multiselect(
     options=list(range(1, TIME_STEPS + 1)),
     default=[1, max(1, TIME_STEPS // 2), TIME_STEPS]
 )
-
 selected_steps = sorted(set(selected_steps))
 
 if len(selected_steps) == 0:
@@ -380,7 +467,6 @@ else:
             for k in ALL_KEYS:
                 row[k] = counts[k][t]
             rows.append(row)
-
     cap_step_df = pd.DataFrame(rows)
 
     # Bin capacities
@@ -391,42 +477,37 @@ else:
 
     cap_step_df["cap_bin"] = pd.cut(cap_step_df["capacity"], bins=bins, include_lowest=True)
 
-    # IMPORTANT: get bin intervals from the Series (avoids the .cat error you saw)
+    # ✅ Fix for your earlier error: categories from the Series
     bin_intervals = cap_step_df["cap_bin"].cat.categories
 
-    for state in states_for_capacity_plot:
+    for metric in states_for_capacity_plot:
         fig = plt.figure(figsize=(10, 6))
         ax = fig.add_subplot(111)
 
         for step in selected_steps:
             sub = cap_step_df[cap_step_df["step"] == step]
 
-            # Mean state count per bin and mean capacity per bin
-            mean_state_by_bin = sub.groupby("cap_bin", observed=True)[state].mean()
+            mean_metric_by_bin = sub.groupby("cap_bin", observed=True)[metric].mean()
             mean_cap_by_bin = sub.groupby("cap_bin", observed=True)["capacity"].mean()
 
-            # Normalize Y by mean capacity in bin
+            # Normalize by mean capacity in bin
             y = []
             for interval in bin_intervals:
-                mean_state = mean_state_by_bin.get(interval, np.nan)
-                mean_cap = mean_cap_by_bin.get(interval, np.nan)
-
-                if pd.isna(mean_state) or pd.isna(mean_cap) or mean_cap == 0:
+                mm = mean_metric_by_bin.get(interval, np.nan)
+                mc = mean_cap_by_bin.get(interval, np.nan)
+                if pd.isna(mm) or pd.isna(mc) or mc == 0:
                     y.append(np.nan)
                 else:
-                    y.append(mean_state / mean_cap)
+                    y.append(mm / mc)
 
             ax.plot(bin_centers, y, marker="o", linestyle="-", label=f"Step {step}")
 
-        ax.set_title(f"{state}: fraction of capacity vs capacity (selected steps)")
+        ax.set_title(f"{metric}: fraction of capacity vs capacity (selected steps)")
         ax.set_xlabel("Capacity (MAX cells/MC)")
-        ax.set_ylabel(f"Fraction of capacity in {state}")
+        ax.set_ylabel(f"{metric} / capacity")
         ax.grid(True, linestyle="--", linewidth=0.5)
         ax.legend(ncol=2, fontsize=9)
-
-        # Often helpful to anchor at 0 for fractions
         ax.set_ylim(0, None)
-
         st.pyplot(fig)
 
 # =========================

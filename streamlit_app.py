@@ -389,7 +389,7 @@ else:
     bin_centers = 0.5 * (bins[:-1] + bins[1:])
 
     cap_step_df["cap_bin"] = pd.cut(cap_step_df["capacity"], bins=bins, include_lowest=True)
-    bin_intervals = pd.cut(bin_centers, bins=bins, include_lowest=True).cat.categories
+    bin_intervals = cap_step_df["cap_bin"].cat.categories
 
     for state in states_for_capacity_plot:
         fig = plt.figure(figsize=(10, 6))
